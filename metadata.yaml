@@ -1,10 +1,7 @@
 homepage: "https://biscotti-cmp.com"
 documentation: "https://biscotti-cmp.com/docs/integrations/gtm"
 versions:
-  # IMPORTANT: `sha` MUST be a real Git commit SHA on the default branch of the
-  # public repository before submitting to the Community Template Gallery.
-  # The previous all-zero value is a placeholder and is NOT accepted by the
-  # Gallery sync. Replace REPLACE_WITH_REAL_COMMIT_SHA after the first commit
-  # to the public repo (see README / submission steps).
-  - sha: "REPLACE_WITH_REAL_COMMIT_SHA"
+  # `sha` points to the commit whose template.tpl is served for this version.
+  # Add a new entry (with the new commit SHA) for each subsequent release.
+  - sha: "aaa66eeba1e9ab1f87890b9ca04153dff0382952"
     changeNotes: "Initial release - Consent Mode v2 defaults + updates from Biscotti consent storage, optional IAB TCF support (gtag_enable_tcf_support), region-specific defaults, ads_data_redaction and url_passthrough."
