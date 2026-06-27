@@ -137,9 +137,8 @@ const makeNumber = require('makeNumber');
 
 const STORAGE_KEY = 'biscotti_consent';
 
-// IMPORTANT: This MUST be Biscotti's Google-issued CMP Developer ID.
-// Verify against the Google CMP Partner Program before publishing.
-const DEVELOPER_ID = 'dYTRkM';
+// Biscotti's Google-issued CMP Developer ID (CMP Partner Program approval).
+const DEVELOPER_ID = 'dOTA1Nj';
 
 const ALL_CONSENT_TYPES = [
   'ad_storage',
