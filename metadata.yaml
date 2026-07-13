@@ -3,5 +3,5 @@ documentation: "https://biscotti-cmp.com/docs/integrations/gtm"
 versions:
   # `sha` points to the commit whose template.tpl is served for this version.
   # Add a new entry (with the new commit SHA) for each subsequent release.
-  - sha: "8899a7fc2932016b396743d08731327dc0d7329d"
-    changeNotes: "Initial release - Consent Mode v2 defaults + updates from Biscotti consent storage, optional IAB TCF support (gtag_enable_tcf_support), region-specific defaults, ads_data_redaction and url_passthrough."
+  - sha: "49e51e851cb5d320e62518c99db7e66f70cd0999"
+    changeNotes: "Consent Mode v2 defaults + updates from Biscotti consent storage, optional IAB TCF support (gtag_enable_tcf_support), region-specific defaults, ads_data_redaction and url_passthrough. Canonical Apache-2.0 LICENSE."
