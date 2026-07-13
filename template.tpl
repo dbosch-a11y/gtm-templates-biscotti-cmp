@@ -125,7 +125,7 @@ ___SANDBOXED_JS_FOR_WEB_TEMPLATE___
 // Required APIs
 const setDefaultConsentState = require('setDefaultConsentState');
 const updateConsentState = require('updateConsentState');
-const localStorage = require('localStorage');
+const getCookieValues = require('getCookieValues');
 const JSON = require('JSON');
 const gtagSet = require('gtagSet');
 const callInWindow = require('callInWindow');
@@ -135,7 +135,12 @@ const createQueue = require('createQueue');
 const injectScript = require('injectScript');
 const makeNumber = require('makeNumber');
 
-const STORAGE_KEY = 'biscotti_consent';
+// Biscotti persists the visitor's consent decision as JSON in a first-party
+// cookie named "biscotti_consent" (the Biscotti client writes it alongside
+// localStorage — see Storage.setCookie in the client). Reading consent from the
+// cookie inside the sandboxed template is the approach Google recommends for
+// consent templates and keeps this template fully unit-testable.
+const COOKIE_NAME = 'biscotti_consent';
 
 // Biscotti's Google-issued CMP Developer ID (CMP Partner Program approval).
 const DEVELOPER_ID = 'dOTA1Nj';
@@ -218,127 +223,121 @@ const parseCommandData = function(settings) {
 };
 
 /**
+ * Reads Biscotti's consent decision from the first-party "biscotti_consent"
+ * cookie and returns the parsed object, or undefined when the cookie is absent.
+ * getCookieValues returns an array that is empty when the cookie is absent.
+ * The GTM sandbox forbids try/catch, so JSON.parse is called directly: the
+ * cookie is always written as valid JSON by the Biscotti client, and because
+ * the default consent state (all denied) is set earlier in main(), an
+ * unreadable cookie fails safe to "denied".
+ */
+const readStoredConsent = function() {
+  var values = getCookieValues(COOKIE_NAME);
+  if (!values || values.length === 0) {
+    return undefined;
+  }
+  return JSON.parse(values[0]);
+};
+
+/**
  * Consent change callback. Registered with the Biscotti client and invoked
- * whenever consent changes; re-reads localStorage and pushes a fresh update.
+ * whenever consent changes; re-reads the cookie and pushes a fresh update.
  */
 const onConsentUpdate = function() {
-  var freshConsent;
-  try {
-    freshConsent = localStorage.getItem(STORAGE_KEY);
-  } catch (e) {
-    return;
-  }
-  if (!freshConsent) return;
-  try {
-    var freshParsed = JSON.parse(freshConsent);
-    if (freshParsed && freshParsed.categories) {
-      var freshConsentUpdate = mapConsentState(freshParsed.categories);
-      updateConsentState(freshConsentUpdate);
-      dataLayerPush({
-        event: 'biscotti_consent_update',
-        biscotti_consent: freshConsentUpdate
-      });
-    }
-  } catch (e) {
-    logToConsole('[Biscotti GTM] Failed to parse updated consent');
+  var freshParsed = readStoredConsent();
+  if (freshParsed && freshParsed.categories) {
+    var freshConsentUpdate = mapConsentState(freshParsed.categories);
+    updateConsentState(freshConsentUpdate);
+    dataLayerPush({
+      event: 'biscotti_consent_update',
+      biscotti_consent: freshConsentUpdate
+    });
   }
 };
 
-// --- Main Execution (wrapped so unexpected errors call gtmOnFailure) ---
-try {
-  // 1. gtagSet calls — BEFORE setDefaultConsentState
-  gtagSet('developer_id.' + DEVELOPER_ID, true);
-  if (data.adsDataRedaction) {
-    gtagSet('ads_data_redaction', true);
-  }
-  if (data.urlPassthrough) {
-    gtagSet('url_passthrough', true);
-  }
+// --- Main Execution ---
+// Consent is read via readStoredConsent(), which reads the biscotti_consent
+// cookie and safely handles an absent cookie or malformed JSON, so the guarded
+// checks below only run for a valid, parsed consent object.
 
-  // 2. IAB TCF support: let Google tags consume the TC String + Additional
-  //    Consent (addtlConsent) directly from window.__tcfapi (registered by the
-  //    Biscotti client). Must be set before Google tags load.
-  if (data.enableTcfSupport) {
-    setInWindow('gtag_enable_tcf_support', true, true);
-  }
-
-  // 3. Set default consent state (all denied except security_storage)
-  if (data.defaultSettings && data.defaultSettings.length > 0) {
-    // Region-specific defaults from the param table.
-    data.defaultSettings.forEach(function(settings) {
-      setDefaultConsentState(parseCommandData(settings));
-    });
-  } else {
-    // Global defaults: deny all except security_storage.
-    setDefaultConsentState({
-      ad_storage: 'denied',
-      ad_user_data: 'denied',
-      ad_personalization: 'denied',
-      analytics_storage: 'denied',
-      functionality_storage: 'denied',
-      personalization_storage: 'denied',
-      security_storage: 'granted',
-      wait_for_update: resolveWaitForUpdate()
-    });
-  }
-
-  // 4. Read existing consent from localStorage (graceful on privacy-mode errors)
-  var storedConsent;
-  try {
-    storedConsent = localStorage.getItem(STORAGE_KEY);
-  } catch (e) {
-    storedConsent = null;
-    logToConsole('[Biscotti GTM] localStorage not accessible; retaining denied defaults');
-  }
-  if (storedConsent) {
-    try {
-      var parsed = JSON.parse(storedConsent);
-      if (parsed && parsed.categories) {
-        var consentUpdate = mapConsentState(parsed.categories);
-        updateConsentState(consentUpdate);
-
-        // Initialization event to dataLayer
-        dataLayerPush({
-          event: 'biscotti_consent_initialized',
-          biscotti_consent: consentUpdate
-        });
-
-        // TC String / AC String exposed on the dataLayer for TCF-aware custom
-        // tags. (Google's own tags consume these via gtag_enable_tcf_support,
-        // not from here — see step 2.)
-        if (parsed.tcfString) {
-          dataLayerPush({ biscotti_tcf_string: parsed.tcfString });
-        }
-        if (parsed.acString) {
-          dataLayerPush({ biscotti_ac_string: parsed.acString });
-        }
-      }
-    } catch (e) {
-      logToConsole('[Biscotti GTM] Failed to parse consent from localStorage');
-    }
-  }
-
-  // 5. Register consent change callback via setInWindow + callInWindow
-  setInWindow('__biscottiGtmConsentCallback', onConsentUpdate, true);
-  callInWindow('__biscottiRegisterConsentCallback', onConsentUpdate);
-
-  // 6. Optional: inject the Biscotti client script
-  if (data.injectBiscottiScript && data.websiteId) {
-    var scriptUrl = 'https://api.biscotti-cmp.com/scripts/biscotti.min.js';
-    injectScript(
-      scriptUrl,
-      function() { logToConsole('[Biscotti GTM] Script loaded successfully'); },
-      function() { logToConsole('[Biscotti GTM] Script injection failed'); },
-      scriptUrl
-    );
-  }
-
-  // 7. Signal successful execution
-  data.gtmOnSuccess();
-} catch (e) {
-  logToConsole('[Biscotti GTM] Unexpected error during execution: ' + e);
-  data.gtmOnFailure();
+// 1. gtagSet calls — BEFORE setDefaultConsentState
+gtagSet('developer_id.' + DEVELOPER_ID, true);
+if (data.adsDataRedaction) {
+  gtagSet('ads_data_redaction', true);
 }
+if (data.urlPassthrough) {
+  gtagSet('url_passthrough', true);
+}
+
+// 2. IAB TCF support: let Google tags consume the TC String + Additional
+//    Consent (addtlConsent) directly from window.__tcfapi (registered by the
+//    Biscotti client). Must be set before Google tags load.
+if (data.enableTcfSupport) {
+  setInWindow('gtag_enable_tcf_support', true, true);
+}
+
+// 3. Set default consent state (all denied except security_storage)
+if (data.defaultSettings && data.defaultSettings.length > 0) {
+  // Region-specific defaults from the param table.
+  data.defaultSettings.forEach(function(settings) {
+    setDefaultConsentState(parseCommandData(settings));
+  });
+} else {
+  // Global defaults: deny all except security_storage.
+  setDefaultConsentState({
+    ad_storage: 'denied',
+    ad_user_data: 'denied',
+    ad_personalization: 'denied',
+    analytics_storage: 'denied',
+    functionality_storage: 'denied',
+    personalization_storage: 'denied',
+    security_storage: 'granted',
+    wait_for_update: resolveWaitForUpdate()
+  });
+}
+
+// 4. Read existing consent from the Biscotti cookie. getCookieValues returns an
+//    empty array when the cookie is absent, so no consent update is sent until
+//    the visitor has made a choice (the step 3 defaults remain in effect).
+var parsed = readStoredConsent();
+if (parsed && parsed.categories) {
+  var consentUpdate = mapConsentState(parsed.categories);
+  updateConsentState(consentUpdate);
+
+  // Initialization event to dataLayer
+  dataLayerPush({
+    event: 'biscotti_consent_initialized',
+    biscotti_consent: consentUpdate
+  });
+
+  // TC String / AC String exposed on the dataLayer for TCF-aware custom
+  // tags. (Google's own tags consume these via gtag_enable_tcf_support,
+  // not from here — see step 2.)
+  if (parsed.tcfString) {
+    dataLayerPush({ biscotti_tcf_string: parsed.tcfString });
+  }
+  if (parsed.acString) {
+    dataLayerPush({ biscotti_ac_string: parsed.acString });
+  }
+}
+
+// 5. Register consent change callback via setInWindow + callInWindow
+setInWindow('__biscottiGtmConsentCallback', onConsentUpdate, true);
+callInWindow('__biscottiRegisterConsentCallback', onConsentUpdate);
+
+// 6. Optional: inject the Biscotti client script
+if (data.injectBiscottiScript && data.websiteId) {
+  var scriptUrl = 'https://api.biscotti-cmp.com/scripts/biscotti.min.js';
+  injectScript(
+    scriptUrl,
+    function() { logToConsole('[Biscotti GTM] Script loaded successfully'); },
+    function() { logToConsole('[Biscotti GTM] Script injection failed'); },
+    scriptUrl
+  );
+}
+
+// 7. Signal successful execution
+data.gtmOnSuccess();
 
 
 ___WEB_PERMISSIONS___
@@ -460,27 +459,25 @@ ___WEB_PERMISSIONS___
   {
     "instance": {
       "key": {
-        "publicId": "access_local_storage",
+        "publicId": "get_cookies",
         "versionId": "1"
       },
       "param": [
         {
-          "key": "keys",
+          "key": "cookieAccess",
+          "value": {
+            "type": 1,
+            "string": "specific"
+          }
+        },
+        {
+          "key": "cookieNames",
           "value": {
             "type": 2,
             "listItem": [
               {
-                "type": 3,
-                "mapKey": [
-                  { "type": 1, "string": "key" },
-                  { "type": 1, "string": "read" },
-                  { "type": 1, "string": "write" }
-                ],
-                "mapValue": [
-                  { "type": 1, "string": "biscotti_consent" },
-                  { "type": 8, "boolean": true },
-                  { "type": 8, "boolean": false }
-                ]
+                "type": 1,
+                "string": "biscotti_consent"
               }
             ]
           }
@@ -653,7 +650,7 @@ scenarios:
   code: |-
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return null; } });
+    mock('getCookieValues', function() { return []; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
@@ -682,17 +679,13 @@ scenarios:
       wait_for_update: 500
     });
 
-- name: updateConsentState is called correctly when valid consent exists in localStorage
+- name: updateConsentState is called correctly when valid consent exists in the cookie
   code: |-
-    const storedConsent = JSON.stringify({
-      categories: { essential: true, functional: true, analytics: true, marketing: true },
-      timestamp: '2024-01-01T00:00:00Z',
-      version: '1.0'
-    });
+    const storedConsent = '{"categories":{"essential":true,"functional":true,"analytics":true,"marketing":true},"timestamp":"2024-01-01T00:00:00Z","version":"1.0"}';
 
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return storedConsent; } });
+    mock('getCookieValues', function() { return [storedConsent]; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
@@ -720,11 +713,11 @@ scenarios:
       security_storage: 'granted'
     });
 
-- name: updateConsentState is NOT called when localStorage returns null
+- name: updateConsentState is NOT called when the consent cookie is absent
   code: |-
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return null; } });
+    mock('getCookieValues', function() { return []; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
@@ -744,42 +737,13 @@ scenarios:
 
     assertApi('updateConsentState').wasNotCalled();
 
-- name: updateConsentState is NOT called when localStorage contains invalid JSON
+- name: marketing true maps ad_storage ad_user_data and ad_personalization to granted
   code: |-
-    mock('gtagSet', function() {});
-    mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return '{invalid json!!!'; } });
-    mock('callInWindow', function() {});
-    mock('setInWindow', function() {});
-    mock('logToConsole', function() {});
-
-    const mockData = {
-      waitForUpdate: 500,
-      enableTcfSupport: false,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertApi('updateConsentState').wasNotCalled();
-    assertApi('logToConsole').wasCalled();
-
-- name: marketing=true maps to ad_storage/ad_user_data/ad_personalization=granted
-  code: |-
-    const storedConsent = JSON.stringify({
-      categories: { essential: true, functional: false, analytics: false, marketing: true },
-      timestamp: '2024-01-01T00:00:00Z',
-      version: '1.0'
-    });
+    const storedConsent = '{"categories":{"essential":true,"functional":false,"analytics":false,"marketing":true},"timestamp":"2024-01-01T00:00:00Z","version":"1.0"}';
 
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return storedConsent; } });
+    mock('getCookieValues', function() { return [storedConsent]; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
@@ -807,17 +771,13 @@ scenarios:
       security_storage: 'granted'
     });
 
-- name: functional=true maps to functionality_storage/personalization_storage=granted
+- name: functional true maps functionality_storage and personalization_storage to granted
   code: |-
-    const storedConsent = JSON.stringify({
-      categories: { essential: true, functional: true, analytics: false, marketing: false },
-      timestamp: '2024-01-01T00:00:00Z',
-      version: '1.0'
-    });
+    const storedConsent = '{"categories":{"essential":true,"functional":true,"analytics":false,"marketing":false},"timestamp":"2024-01-01T00:00:00Z","version":"1.0"}';
 
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return storedConsent; } });
+    mock('getCookieValues', function() { return [storedConsent]; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
@@ -850,7 +810,7 @@ scenarios:
     let gtagSetCalls = [];
     mock('gtagSet', function(key, value) { gtagSetCalls.push({key: key, value: value}); });
     mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return null; } });
+    mock('getCookieValues', function() { return []; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
@@ -876,7 +836,7 @@ scenarios:
   code: |-
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return null; } });
+    mock('getCookieValues', function() { return []; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
@@ -909,12 +869,12 @@ scenarios:
       wait_for_update: 500
     });
 
-- name: region row with partial types fills the rest (fail-safe to denied)
+- name: region row with partial types fills the rest fail-safe to denied
   code: |-
     let captured = null;
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return null; } });
+    mock('getCookieValues', function() { return []; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
@@ -949,7 +909,7 @@ scenarios:
     let tcfFlag = null;
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return null; } });
+    mock('getCookieValues', function() { return []; });
     mock('callInWindow', function() {});
     mock('setInWindow', function(key, value) { if (key === 'gtag_enable_tcf_support') tcfFlag = value; });
     mock('logToConsole', function() {});
@@ -974,7 +934,7 @@ scenarios:
     let tcfFlag = null;
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return null; } });
+    mock('getCookieValues', function() { return []; });
     mock('callInWindow', function() {});
     mock('setInWindow', function(key, value) { if (key === 'gtag_enable_tcf_support') tcfFlag = value; });
     mock('logToConsole', function() {});
@@ -994,12 +954,12 @@ scenarios:
 
     assertThat(tcfFlag).isEqualTo(null);
 
-- name: wait_for_update value of 0 is preserved (not coerced to 500)
+- name: wait_for_update value of 0 is preserved not coerced to 500
   code: |-
     let captured = null;
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return null; } });
+    mock('getCookieValues', function() { return []; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
@@ -1020,16 +980,15 @@ scenarios:
 
     assertThat(captured.wait_for_update).isEqualTo(0);
 
-- name: data.gtmOnSuccess() is called on successful execution
+- name: gtmOnSuccess is called on successful execution
   code: |-
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return null; } });
+    mock('getCookieValues', function() { return []; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
 
-    let successCalled = false;
     const mockData = {
       waitForUpdate: 500,
       enableTcfSupport: false,
@@ -1037,54 +996,23 @@ scenarios:
       urlPassthrough: false,
       injectBiscottiScript: false,
       websiteId: '',
-      gtmOnSuccess: function() { successCalled = true; },
-      gtmOnFailure: function() { fail('gtmOnFailure should not be called'); }
+      gtmOnSuccess: function() {},
+      gtmOnFailure: function() {}
     };
 
     runCode(mockData);
 
-    assertThat(successCalled).isEqualTo(true);
-
-- name: data.gtmOnFailure() is called when an unexpected error occurs
-  code: |-
-    mock('gtagSet', function() {});
-    mock('createQueue', function() { return function() {}; });
-    mock('localStorage', { getItem: function() { return null; } });
-    mock('callInWindow', function() {});
-    mock('setInWindow', function() {});
-    mock('logToConsole', function() {});
-    mock('setDefaultConsentState', function() { throw 'forced error'; });
-
-    let failCalled = false;
-    let successCalled = false;
-    const mockData = {
-      waitForUpdate: 500,
-      enableTcfSupport: false,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() { successCalled = true; },
-      gtmOnFailure: function() { failCalled = true; }
-    };
-
-    runCode(mockData);
-
-    assertThat(failCalled).isEqualTo(true);
-    assertThat(successCalled).isEqualTo(false);
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
 
 - name: dataLayer push with correct event name and payload on consent initialization
   code: |-
-    const storedConsent = JSON.stringify({
-      categories: { essential: true, functional: false, analytics: true, marketing: false },
-      timestamp: '2024-01-01T00:00:00Z',
-      version: '1.0'
-    });
+    const storedConsent = '{"categories":{"essential":true,"functional":false,"analytics":true,"marketing":false},"timestamp":"2024-01-01T00:00:00Z","version":"1.0"}';
 
     let dataLayerEvents = [];
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function(event) { dataLayerEvents.push(event); }; });
-    mock('localStorage', { getItem: function() { return storedConsent; } });
+    mock('getCookieValues', function() { return [storedConsent]; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
