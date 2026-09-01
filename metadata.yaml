@@ -3,6 +3,10 @@ documentation: "https://biscotti-cmp.com/docs/integrations/gtm"
 versions:
   # `sha` points to the commit whose template.tpl is served for this version.
   # Add a new entry (with the new commit SHA) for each subsequent release.
+  - sha: "eb44633f3c5acfed313c93fa254fdba7723d935a"
+    changeNotes: |
+      Encode the user-provided Biscotti Website ID with encodeUriComponent before
+      adding it to the client-library URL. Invalid URI input skips injection.
   - sha: "117e3196965711499b8eafcf51c18fd00693158c"
     changeNotes: |
       Switch consent read from localStorage to getCookieValues (Google canonical
