@@ -133,6 +133,7 @@ const setInWindow = require('setInWindow');
 const logToConsole = require('logToConsole');
 const createQueue = require('createQueue');
 const injectScript = require('injectScript');
+const encodeUriComponent = require('encodeUriComponent');
 const makeNumber = require('makeNumber');
 
 // Biscotti persists the visitor's consent decision as JSON in a first-party
@@ -325,15 +326,21 @@ if (parsed && parsed.categories) {
 setInWindow('__biscottiGtmConsentCallback', onConsentUpdate, true);
 callInWindow('__biscottiRegisterConsentCallback', onConsentUpdate);
 
-// 6. Optional: inject the Biscotti client script
+// 6. Optional: inject the Biscotti client script. The Website ID is
+// user-provided input and must be encoded before it becomes part of the URL.
 if (data.injectBiscottiScript && data.websiteId) {
-  var scriptUrl = 'https://api.biscotti-cmp.com/scripts/biscotti.min.js';
-  injectScript(
-    scriptUrl,
-    function() { logToConsole('[Biscotti GTM] Script loaded successfully'); },
-    function() { logToConsole('[Biscotti GTM] Script injection failed'); },
-    scriptUrl
-  );
+  var encodedWebsiteId = encodeUriComponent(data.websiteId);
+  if (encodedWebsiteId !== undefined) {
+    var scriptUrl = 'https://api.biscotti-cmp.com/scripts/biscotti.min.js?websiteId=' + encodedWebsiteId;
+    injectScript(
+      scriptUrl,
+      function() { logToConsole('[Biscotti GTM] Script loaded successfully'); },
+      function() { logToConsole('[Biscotti GTM] Script injection failed'); },
+      scriptUrl
+    );
+  } else {
+    logToConsole('[Biscotti GTM] Website ID could not be URI-encoded; script injection skipped');
+  }
 }
 
 // 7. Signal successful execution
