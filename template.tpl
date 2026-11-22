@@ -11,16 +11,21 @@ ___INFO___
 {
   "type": "TAG",
   "id": "biscotti_cmp_consent_mode",
-  "version": 1,
+  "version": 2,
   "securityGroups": [],
   "displayName": "Biscotti CMP - Consent Mode",
   "brand": {
     "id": "brand_biscotti_cmp",
     "displayName": "Biscotti CMP"
   },
-  "description": "Consent management template for Biscotti CMP. Sets Google Consent Mode v2 defaults and updates consent state from Biscotti\u0027s consent storage. Optional IAB TCF support for Google tags.",
-  "categories": ["TAG_MANAGEMENT", "PERSONALIZATION"],
-  "containerContexts": ["WEB"]
+  "description": "Consent Mode v2 defaults and updates for Biscotti CMP. Requires the Biscotti pre-GTM head snippet so the request shield and IAB TCF stub exist before the container.",
+  "categories": [
+    "TAG_MANAGEMENT",
+    "PERSONALIZATION"
+  ],
+  "containerContexts": [
+    "WEB"
+  ]
 }
 
 
@@ -28,22 +33,16 @@ ___TEMPLATE_PARAMETERS___
 
 [
   {
-    "type": "TEXT",
-    "name": "websiteId",
-    "displayName": "Biscotti Website ID",
-    "simpleValueType": true,
-    "help": "Your Biscotti website identifier (found in dashboard). Optional if script is loaded externally."
-  },
-  {
     "type": "PARAM_TABLE",
     "name": "defaultSettings",
-    "displayName": "Default Consent Settings",
+    "displayName": "Regional Consent Defaults",
+    "help": "Optional stricter region rows. A global denied fallback is always installed first. Unknown consent types, conflicts, invalid regions and attempts to deny security_storage fail closed.",
     "paramTableColumns": [
       {
         "param": {
           "type": "TEXT",
           "name": "region",
-          "displayName": "Region (ISO 3166-2 codes, comma-separated)",
+          "displayName": "ISO 3166-2 regions (comma-separated)",
           "simpleValueType": true
         },
         "isUnique": false
@@ -74,7 +73,7 @@ ___TEMPLATE_PARAMETERS___
     "displayName": "Wait for Update (ms)",
     "simpleValueType": true,
     "defaultValue": "500",
-    "help": "Time in ms to wait for Biscotti to load before using defaults",
+    "help": "0 to 10000 ms. Invalid values fall back to 500 ms.",
     "valueValidators": [
       {
         "type": "NON_NEGATIVE_NUMBER"
@@ -85,10 +84,10 @@ ___TEMPLATE_PARAMETERS___
     "type": "CHECKBOX",
     "name": "enableTcfSupport",
     "displayName": "Enable IAB TCF support for Google tags",
-    "checkboxText": "Map IAB TCF consent to Google tags",
+    "checkboxText": "Let Google tags read the TC String from window.__tcfapi",
     "simpleValueType": true,
     "defaultValue": false,
-    "help": "Enable when Biscotti\u0027s IAB TCF mode is active. Sets gtag_enable_tcf_support so Google tags read the TC String and Additional Consent (addtlConsent) directly from window.__tcfapi, which the Biscotti client registers."
+    "help": "Enable only when TCF is active in Biscotti. The required pre-GTM head snippet installs window.__tcfapi before this container."
   },
   {
     "type": "CHECKBOX",
@@ -96,8 +95,7 @@ ___TEMPLATE_PARAMETERS___
     "displayName": "Redact Ads Data",
     "checkboxText": "Enable ads data redaction",
     "simpleValueType": true,
-    "defaultValue": false,
-    "help": "When enabled and ad_storage is denied, ad click identifiers in requests are redacted"
+    "defaultValue": false
   },
   {
     "type": "CHECKBOX",
@@ -105,246 +103,235 @@ ___TEMPLATE_PARAMETERS___
     "displayName": "Pass through URL parameters",
     "checkboxText": "Enable URL passthrough",
     "simpleValueType": true,
-    "defaultValue": false,
-    "help": "Pass ad click info via URL parameters when cookies are denied"
-  },
-  {
-    "type": "CHECKBOX",
-    "name": "injectBiscottiScript",
-    "displayName": "Load Biscotti script via GTM",
-    "checkboxText": "Inject Biscotti client script",
-    "simpleValueType": true,
-    "defaultValue": false,
-    "help": "Inject the Biscotti client script. Disable if script is already on the page."
+    "defaultValue": false
   }
 ]
 
 
 ___SANDBOXED_JS_FOR_WEB_TEMPLATE___
 
-// Required APIs
+// GTM Sandboxed JavaScript — generated; edit this builder + src/contract.js.
 const setDefaultConsentState = require('setDefaultConsentState');
 const updateConsentState = require('updateConsentState');
-const getCookieValues = require('getCookieValues');
+const localStorage = require('localStorage');
 const JSON = require('JSON');
 const gtagSet = require('gtagSet');
 const callInWindow = require('callInWindow');
+const copyFromWindow = require('copyFromWindow');
 const setInWindow = require('setInWindow');
 const logToConsole = require('logToConsole');
 const createQueue = require('createQueue');
-const injectScript = require('injectScript');
-const encodeUriComponent = require('encodeUriComponent');
-const makeNumber = require('makeNumber');
 
-// Biscotti persists the visitor's consent decision as JSON in a first-party
-// cookie named "biscotti_consent" (the Biscotti client writes it alongside
-// localStorage — see Storage.setCookie in the client). Reading consent from the
-// cookie inside the sandboxed template is the approach Google recommends for
-// consent templates and keeps this template fully unit-testable.
-const COOKIE_NAME = 'biscotti_consent';
-
-// Biscotti's Google-issued CMP Developer ID (CMP Partner Program approval).
+const STORAGE_KEY = 'biscotti_consent';
 const DEVELOPER_ID = 'dOTA1Nj';
-
-const ALL_CONSENT_TYPES = [
-  'ad_storage',
-  'ad_user_data',
-  'ad_personalization',
-  'analytics_storage',
-  'functionality_storage',
-  'personalization_storage',
-  'security_storage'
-];
-
+const TEMPLATE_VERSION = '2.0.0';
 const dataLayerPush = createQueue('dataLayer');
 
-/**
- * Maps Biscotti consent categories to Google Consent Mode v2 signals.
- * marketing  -> ad_storage, ad_user_data, ad_personalization
- * analytics  -> analytics_storage
- * functional -> functionality_storage, personalization_storage
- * security_storage is always granted.
- */
-const mapConsentState = function(categories) {
-  var granted = function(val) {
-    return val === true ? 'granted' : 'denied';
-  };
-  return {
-    ad_storage: granted(categories.marketing),
-    ad_user_data: granted(categories.marketing),
-    ad_personalization: granted(categories.marketing),
-    analytics_storage: granted(categories.analytics),
-    functionality_storage: granted(categories.functional),
-    personalization_storage: granted(categories.functional),
-    security_storage: 'granted'
-  };
-};
+// BEGIN GENERATED CONTRACT — src/contract.js; do not edit in template.tpl
 
-/**
- * Resolves wait_for_update, preserving an explicit 0.
- * (`data.waitForUpdate || 500` would wrongly turn a user-configured 0 into 500.)
- * Falls back to 500 for NaN/negative/empty values.
- */
-const resolveWaitForUpdate = function() {
-  var w = makeNumber(data.waitForUpdate);
-  if (!(w >= 0)) {
-    return 500;
-  }
-  return w;
-};
+const ALL_CONSENT_TYPES = [
+  "ad_storage",
+  "ad_user_data",
+  "ad_personalization",
+  "analytics_storage",
+  "functionality_storage",
+  "personalization_storage",
+  "security_storage"
+];
 
-/**
- * Parses a defaultSettings row into a consent command data object.
- * Every consent type is always set (missing -> denied, security_storage ->
- * granted) so a configured region never ends up with partially-undefined
- * signals (which would trigger "tag read consent before default was set").
- */
-const parseCommandData = function(settings) {
-  var splitInput = function(input) {
-    if (!input) return [];
-    return input.split(',').map(function(e) { return e.trim(); }).filter(function(e) { return e.length > 0; });
-  };
-  var regions = splitInput(settings.region);
-  var grantedTypes = splitInput(settings.granted);
-  var deniedTypes = splitInput(settings.denied);
-  var commandData = {};
-  if (regions.length > 0) {
-    commandData.region = regions;
-  }
-  grantedTypes.forEach(function(entry) { commandData[entry] = 'granted'; });
-  deniedTypes.forEach(function(entry) { commandData[entry] = 'denied'; });
-  // Ensure completeness for this region (fail-safe to denied).
-  ALL_CONSENT_TYPES.forEach(function(t) {
-    if (commandData[t] === undefined) {
-      commandData[t] = (t === 'security_storage') ? 'granted' : 'denied';
+const DEFAULT_WAIT_FOR_UPDATE = 500;
+
+const MAX_WAIT_FOR_UPDATE = 10000;
+
+function splitCsv(input) {
+  if (!input || typeof input !== 'string') return [];
+  var out = [];
+  input.split(',').forEach(function (raw) {
+    var value = raw.trim();
+    if (value && out.indexOf(value) === -1) out.push(value);
+  });
+  return out;
+}
+
+function parseConsentTypes(input) {
+  var values = splitCsv(input);
+  for (var i = 0; i < values.length; i += 1) {
+    if (ALL_CONSENT_TYPES.indexOf(values[i]) === -1) {
+      return { ok: false, error: 'Unknown consent type: ' + values[i], values: [] };
     }
-  });
-  commandData.wait_for_update = resolveWaitForUpdate();
-  return commandData;
-};
-
-/**
- * Reads Biscotti's consent decision from the first-party "biscotti_consent"
- * cookie and returns the parsed object, or undefined when the cookie is absent.
- * getCookieValues returns an array that is empty when the cookie is absent.
- * The GTM sandbox forbids try/catch, so JSON.parse is called directly: the
- * cookie is always written as valid JSON by the Biscotti client, and because
- * the default consent state (all denied) is set earlier in main(), an
- * unreadable cookie fails safe to "denied".
- */
-const readStoredConsent = function() {
-  var values = getCookieValues(COOKIE_NAME);
-  if (!values || values.length === 0) {
-    return undefined;
   }
-  return JSON.parse(values[0]);
-};
+  return { ok: true, error: null, values: values };
+}
 
-/**
- * Consent change callback. Registered with the Biscotti client and invoked
- * whenever consent changes; re-reads the cookie and pushes a fresh update.
- */
-const onConsentUpdate = function() {
-  var freshParsed = readStoredConsent();
-  if (freshParsed && freshParsed.categories) {
-    var freshConsentUpdate = mapConsentState(freshParsed.categories);
-    updateConsentState(freshConsentUpdate);
-    dataLayerPush({
-      event: 'biscotti_consent_update',
-      biscotti_consent: freshConsentUpdate
-    });
+function parseRegions(input) {
+  var raw = splitCsv(input);
+  var values = [];
+  for (var i = 0; i < raw.length; i += 1) {
+    var value = raw[i].toUpperCase();
+    if (!/^[A-Z]{2}(?:-[A-Z0-9]{1,3})?$/.test(value)) {
+      return { ok: false, error: 'Invalid ISO 3166-2 region: ' + raw[i], values: [] };
+    }
+    if (values.indexOf(value) === -1) values.push(value);
   }
-};
-
-// --- Main Execution ---
-// Consent is read via readStoredConsent(), which reads the biscotti_consent
-// cookie and safely handles an absent cookie or malformed JSON, so the guarded
-// checks below only run for a valid, parsed consent object.
-
-// 1. gtagSet calls — BEFORE setDefaultConsentState
-gtagSet('developer_id.' + DEVELOPER_ID, true);
-if (data.adsDataRedaction) {
-  gtagSet('ads_data_redaction', true);
-}
-if (data.urlPassthrough) {
-  gtagSet('url_passthrough', true);
+  if (values.length === 0) {
+    return { ok: false, error: 'A regional default row needs at least one region', values: [] };
+  }
+  return { ok: true, error: null, values: values };
 }
 
-// 2. IAB TCF support: let Google tags consume the TC String + Additional
-//    Consent (addtlConsent) directly from window.__tcfapi (registered by the
-//    Biscotti client). Must be set before Google tags load.
-if (data.enableTcfSupport) {
-  setInWindow('gtag_enable_tcf_support', true, true);
+function resolveWaitForUpdate(value) {
+  if ((typeof value !== 'number' && typeof value !== 'string') || value === '') {
+    return DEFAULT_WAIT_FOR_UPDATE;
+  }
+  // Multiplication is supported in GTM Sandboxed JavaScript and performs the
+  // numeric coercion needed for values coming from a TEXT parameter without
+  // relying on the unavailable global Number.
+  var n = value * 1;
+  if (n !== n || n < 0 || n > MAX_WAIT_FOR_UPDATE) {
+    return DEFAULT_WAIT_FOR_UPDATE;
+  }
+  return n;
 }
 
-// 3. Set default consent state (all denied except security_storage)
-if (data.defaultSettings && data.defaultSettings.length > 0) {
-  // Region-specific defaults from the param table.
-  data.defaultSettings.forEach(function(settings) {
-    setDefaultConsentState(parseCommandData(settings));
-  });
-} else {
-  // Global defaults: deny all except security_storage.
-  setDefaultConsentState({
-    ad_storage: 'denied',
-    ad_user_data: 'denied',
-    ad_personalization: 'denied',
-    analytics_storage: 'denied',
-    functionality_storage: 'denied',
-    personalization_storage: 'denied',
+function mapConsentState(categories) {
+  var c = categories && typeof categories === 'object' ? categories : {};
+  var granted = function (value) { return value === true ? 'granted' : 'denied'; };
+  return {
+    ad_storage: granted(c.marketing),
+    ad_user_data: granted(c.marketing),
+    ad_personalization: granted(c.marketing),
+    analytics_storage: granted(c.analytics),
+    functionality_storage: granted(c.functional),
+    personalization_storage: granted(c.functional),
     security_storage: 'granted',
-    wait_for_update: resolveWaitForUpdate()
+  };
+}
+
+function parseDefaultRow(settings, waitForUpdate) {
+  var row = settings && typeof settings === 'object' ? settings : {};
+  var regions = parseRegions(row.region);
+  if (!regions.ok) return { ok: false, error: regions.error, value: null };
+
+  var granted = parseConsentTypes(row.granted);
+  if (!granted.ok) return { ok: false, error: granted.error, value: null };
+  var denied = parseConsentTypes(row.denied);
+  if (!denied.ok) return { ok: false, error: denied.error, value: null };
+
+  // security_storage covers essential fraud prevention/authentication and is an
+  // invariant of this template. A row that tries to deny it is rejected rather
+  // than silently changing the user's request or violating the invariant.
+  if (denied.values.indexOf('security_storage') !== -1) {
+    return { ok: false, error: 'security_storage cannot be denied', value: null };
+  }
+
+  for (var i = 0; i < granted.values.length; i += 1) {
+    if (denied.values.indexOf(granted.values[i]) !== -1) {
+      return { ok: false, error: 'Consent type appears in granted and denied: ' + granted.values[i], value: null };
+    }
+  }
+
+  var value = { region: regions.values };
+  ALL_CONSENT_TYPES.forEach(function (type) {
+    if (type === 'security_storage') value[type] = 'granted';
+    else if (granted.values.indexOf(type) !== -1) value[type] = 'granted';
+    else value[type] = 'denied';
   });
+  value.wait_for_update = resolveWaitForUpdate(waitForUpdate);
+  return { ok: true, error: null, value: value };
 }
 
-// 4. Read existing consent from the Biscotti cookie. getCookieValues returns an
-//    empty array when the cookie is absent, so no consent update is sent until
-//    the visitor has made a choice (the step 3 defaults remain in effect).
-var parsed = readStoredConsent();
-if (parsed && parsed.categories) {
-  var consentUpdate = mapConsentState(parsed.categories);
-  updateConsentState(consentUpdate);
-
-  // Initialization event to dataLayer
-  dataLayerPush({
-    event: 'biscotti_consent_initialized',
-    biscotti_consent: consentUpdate
-  });
-
-  // TC String / AC String exposed on the dataLayer for TCF-aware custom
-  // tags. (Google's own tags consume these via gtag_enable_tcf_support,
-  // not from here — see step 2.)
-  if (parsed.tcfString) {
-    dataLayerPush({ biscotti_tcf_string: parsed.tcfString });
-  }
-  if (parsed.acString) {
-    dataLayerPush({ biscotti_ac_string: parsed.acString });
-  }
+function globalDeniedDefault(waitForUpdate) {
+  var value = mapConsentState({ functional: false, analytics: false, marketing: false });
+  value.wait_for_update = resolveWaitForUpdate(waitForUpdate);
+  return value;
 }
 
-// 5. Register consent change callback via setInWindow + callInWindow
-setInWindow('__biscottiGtmConsentCallback', onConsentUpdate, true);
-callInWindow('__biscottiRegisterConsentCallback', onConsentUpdate);
+// END GENERATED CONTRACT
 
-// 6. Optional: inject the Biscotti client script. The Website ID is
-// user-provided input and must be encoded before it becomes part of the URL.
-if (data.injectBiscottiScript && data.websiteId) {
-  var encodedWebsiteId = encodeUriComponent(data.websiteId);
-  if (encodedWebsiteId !== undefined) {
-    var scriptUrl = 'https://api.biscotti-cmp.com/scripts/biscotti.min.js?websiteId=' + encodedWebsiteId;
-    injectScript(
-      scriptUrl,
-      function() { logToConsole('[Biscotti GTM] Script loaded successfully'); },
-      function() { logToConsole('[Biscotti GTM] Script injection failed'); },
-      scriptUrl
-    );
-  } else {
-    logToConsole('[Biscotti GTM] Website ID could not be URI-encoded; script injection skipped');
+const publishStoredConsent = function(eventName) {
+  var raw;
+  try {
+    raw = localStorage.getItem(STORAGE_KEY);
+  } catch (e) {
+    logToConsole('[Biscotti GTM] localStorage unavailable; denied defaults stay active');
+    return;
   }
-}
+  if (!raw) return;
+  try {
+    var parsed = JSON.parse(raw);
+    var categories = parsed ? (parsed.categories || parsed) : null;
+    if (!categories) return;
+    var mapped = mapConsentState(categories);
+    updateConsentState(mapped);
+    dataLayerPush({
+      event: eventName,
+      biscotti_consent: mapped,
+      // Always publish both keys, including null, so withdraw/reject cannot leave
+      // a stale TC/AC string in the dataLayer from the previous decision.
+      biscotti_tcf_string: parsed.tcfString || null,
+      biscotti_ac_string: parsed.acString || null
+    });
+  } catch (e) {
+    logToConsole('[Biscotti GTM] Invalid biscotti_consent JSON; denied defaults stay active');
+  }
+};
 
-// 7. Signal successful execution
-data.gtmOnSuccess();
+const onConsentUpdate = function() {
+  publishStoredConsent('biscotti_consent_update');
+};
+
+const run = function() {
+  // A second tag would register the same callback twice and emit every dataLayer
+  // update twice. It is not a second CMP — the engine guards its own instance —
+  // but it is still an ambiguous container configuration, so fail closed.
+  if (copyFromWindow('__biscottiGtmTemplateVersion')) {
+    logToConsole('[Biscotti GTM] Template already initialized; duplicate tag ignored');
+    data.gtmOnSuccess();
+    return;
+  }
+  setInWindow('__biscottiGtmTemplateVersion', TEMPLATE_VERSION, false);
+
+  // gtagSet flags must precede the default consent commands.
+  gtagSet('developer_id.' + DEVELOPER_ID, true);
+  if (data.adsDataRedaction) gtagSet('ads_data_redaction', true);
+  if (data.urlPassthrough) gtagSet('url_passthrough', true);
+  if (data.enableTcfSupport) setInWindow('gtag_enable_tcf_support', true, true);
+
+  // Global fallback ALWAYS comes first, even if regional rows exist. The old
+  // template used either regional OR global defaults, leaving visitors outside
+  // every listed region with no default at all.
+  setDefaultConsentState(globalDeniedDefault(data.waitForUpdate));
+
+  var rows = data.defaultSettings || [];
+  for (var i = 0; i < rows.length; i += 1) {
+    var parsedRow = parseDefaultRow(rows[i], data.waitForUpdate);
+    if (!parsedRow.ok) {
+      logToConsole('[Biscotti GTM] Invalid regional default: ' + parsedRow.error);
+      data.gtmOnFailure();
+      return;
+    }
+    setDefaultConsentState(parsedRow.value);
+  }
+
+  publishStoredConsent('biscotti_consent_initialized');
+
+  // The durable global callback is canonical. GTM's callInWindow cannot be
+  // relied upon to deliver a sandboxed function to the page-side registrar, and
+  // the engine may already have initialized before this tag runs. The engine
+  // consumes the global slot lazily and uses the template version to avoid
+  // invoking the same template callback twice.
+  setInWindow('__biscottiGtmConsentCallback', onConsentUpdate, true);
+  callInWindow('__biscottiRegisterConsentCallback', onConsentUpdate, TEMPLATE_VERSION);
+
+  data.gtmOnSuccess();
+};
+
+try {
+  run();
+} catch (e) {
+  logToConsole('[Biscotti GTM] Unexpected error: ' + e);
+  data.gtmOnFailure();
+}
 
 
 ___WEB_PERMISSIONS___
@@ -365,92 +352,218 @@ ___WEB_PERMISSIONS___
               {
                 "type": 3,
                 "mapKey": [
-                  { "type": 1, "string": "consentType" },
-                  { "type": 1, "string": "read" },
-                  { "type": 1, "string": "write" }
+                  {
+                    "type": 1,
+                    "string": "consentType"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  }
                 ],
                 "mapValue": [
-                  { "type": 1, "string": "ad_storage" },
-                  { "type": 8, "boolean": false },
-                  { "type": 8, "boolean": true }
+                  {
+                    "type": 1,
+                    "string": "ad_storage"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  }
                 ]
               },
               {
                 "type": 3,
                 "mapKey": [
-                  { "type": 1, "string": "consentType" },
-                  { "type": 1, "string": "read" },
-                  { "type": 1, "string": "write" }
+                  {
+                    "type": 1,
+                    "string": "consentType"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  }
                 ],
                 "mapValue": [
-                  { "type": 1, "string": "ad_user_data" },
-                  { "type": 8, "boolean": false },
-                  { "type": 8, "boolean": true }
+                  {
+                    "type": 1,
+                    "string": "ad_user_data"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  }
                 ]
               },
               {
                 "type": 3,
                 "mapKey": [
-                  { "type": 1, "string": "consentType" },
-                  { "type": 1, "string": "read" },
-                  { "type": 1, "string": "write" }
+                  {
+                    "type": 1,
+                    "string": "consentType"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  }
                 ],
                 "mapValue": [
-                  { "type": 1, "string": "ad_personalization" },
-                  { "type": 8, "boolean": false },
-                  { "type": 8, "boolean": true }
+                  {
+                    "type": 1,
+                    "string": "ad_personalization"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  }
                 ]
               },
               {
                 "type": 3,
                 "mapKey": [
-                  { "type": 1, "string": "consentType" },
-                  { "type": 1, "string": "read" },
-                  { "type": 1, "string": "write" }
+                  {
+                    "type": 1,
+                    "string": "consentType"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  }
                 ],
                 "mapValue": [
-                  { "type": 1, "string": "analytics_storage" },
-                  { "type": 8, "boolean": false },
-                  { "type": 8, "boolean": true }
+                  {
+                    "type": 1,
+                    "string": "analytics_storage"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  }
                 ]
               },
               {
                 "type": 3,
                 "mapKey": [
-                  { "type": 1, "string": "consentType" },
-                  { "type": 1, "string": "read" },
-                  { "type": 1, "string": "write" }
+                  {
+                    "type": 1,
+                    "string": "consentType"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  }
                 ],
                 "mapValue": [
-                  { "type": 1, "string": "functionality_storage" },
-                  { "type": 8, "boolean": false },
-                  { "type": 8, "boolean": true }
+                  {
+                    "type": 1,
+                    "string": "functionality_storage"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  }
                 ]
               },
               {
                 "type": 3,
                 "mapKey": [
-                  { "type": 1, "string": "consentType" },
-                  { "type": 1, "string": "read" },
-                  { "type": 1, "string": "write" }
+                  {
+                    "type": 1,
+                    "string": "consentType"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  }
                 ],
                 "mapValue": [
-                  { "type": 1, "string": "personalization_storage" },
-                  { "type": 8, "boolean": false },
-                  { "type": 8, "boolean": true }
+                  {
+                    "type": 1,
+                    "string": "personalization_storage"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  }
                 ]
               },
               {
                 "type": 3,
                 "mapKey": [
-                  { "type": 1, "string": "consentType" },
-                  { "type": 1, "string": "read" },
-                  { "type": 1, "string": "write" }
+                  {
+                    "type": 1,
+                    "string": "consentType"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  }
                 ],
                 "mapValue": [
-                  { "type": 1, "string": "security_storage" },
-                  { "type": 8, "boolean": false },
-                  { "type": 8, "boolean": true }
+                  {
+                    "type": 1,
+                    "string": "security_storage"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  }
                 ]
               }
             ]
@@ -466,25 +579,45 @@ ___WEB_PERMISSIONS___
   {
     "instance": {
       "key": {
-        "publicId": "get_cookies",
+        "publicId": "access_local_storage",
         "versionId": "1"
       },
       "param": [
         {
-          "key": "cookieAccess",
-          "value": {
-            "type": 1,
-            "string": "specific"
-          }
-        },
-        {
-          "key": "cookieNames",
+          "key": "keys",
           "value": {
             "type": 2,
             "listItem": [
               {
-                "type": 1,
-                "string": "biscotti_consent"
+                "type": 3,
+                "mapKey": [
+                  {
+                    "type": 1,
+                    "string": "key"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  }
+                ],
+                "mapValue": [
+                  {
+                    "type": 1,
+                    "string": "biscotti_consent"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  }
+                ]
               }
             ]
           }
@@ -511,86 +644,198 @@ ___WEB_PERMISSIONS___
               {
                 "type": 3,
                 "mapKey": [
-                  { "type": 1, "string": "key" },
-                  { "type": 1, "string": "read" },
-                  { "type": 1, "string": "write" },
-                  { "type": 1, "string": "execute" }
+                  {
+                    "type": 1,
+                    "string": "key"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  },
+                  {
+                    "type": 1,
+                    "string": "execute"
+                  }
                 ],
                 "mapValue": [
-                  { "type": 1, "string": "dataLayer" },
-                  { "type": 8, "boolean": true },
-                  { "type": 8, "boolean": true },
-                  { "type": 8, "boolean": false }
+                  {
+                    "type": 1,
+                    "string": "dataLayer"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  }
                 ]
               },
               {
                 "type": 3,
                 "mapKey": [
-                  { "type": 1, "string": "key" },
-                  { "type": 1, "string": "read" },
-                  { "type": 1, "string": "write" },
-                  { "type": 1, "string": "execute" }
+                  {
+                    "type": 1,
+                    "string": "key"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  },
+                  {
+                    "type": 1,
+                    "string": "execute"
+                  }
                 ],
                 "mapValue": [
-                  { "type": 1, "string": "__biscottiRegisterConsentCallback" },
-                  { "type": 8, "boolean": false },
-                  { "type": 8, "boolean": false },
-                  { "type": 8, "boolean": true }
+                  {
+                    "type": 1,
+                    "string": "__biscottiRegisterConsentCallback"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  }
                 ]
               },
               {
                 "type": 3,
                 "mapKey": [
-                  { "type": 1, "string": "key" },
-                  { "type": 1, "string": "read" },
-                  { "type": 1, "string": "write" },
-                  { "type": 1, "string": "execute" }
+                  {
+                    "type": 1,
+                    "string": "key"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  },
+                  {
+                    "type": 1,
+                    "string": "execute"
+                  }
                 ],
                 "mapValue": [
-                  { "type": 1, "string": "__biscottiGtmConsentCallback" },
-                  { "type": 8, "boolean": false },
-                  { "type": 8, "boolean": true },
-                  { "type": 8, "boolean": false }
+                  {
+                    "type": 1,
+                    "string": "__biscottiGtmConsentCallback"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  }
                 ]
               },
               {
                 "type": 3,
                 "mapKey": [
-                  { "type": 1, "string": "key" },
-                  { "type": 1, "string": "read" },
-                  { "type": 1, "string": "write" },
-                  { "type": 1, "string": "execute" }
+                  {
+                    "type": 1,
+                    "string": "key"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  },
+                  {
+                    "type": 1,
+                    "string": "execute"
+                  }
                 ],
                 "mapValue": [
-                  { "type": 1, "string": "gtag_enable_tcf_support" },
-                  { "type": 8, "boolean": false },
-                  { "type": 8, "boolean": true },
-                  { "type": 8, "boolean": false }
+                  {
+                    "type": 1,
+                    "string": "__biscottiGtmTemplateVersion"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  }
+                ]
+              },
+              {
+                "type": 3,
+                "mapKey": [
+                  {
+                    "type": 1,
+                    "string": "key"
+                  },
+                  {
+                    "type": 1,
+                    "string": "read"
+                  },
+                  {
+                    "type": 1,
+                    "string": "write"
+                  },
+                  {
+                    "type": 1,
+                    "string": "execute"
+                  }
+                ],
+                "mapValue": [
+                  {
+                    "type": 1,
+                    "string": "gtag_enable_tcf_support"
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  },
+                  {
+                    "type": 8,
+                    "boolean": true
+                  },
+                  {
+                    "type": 8,
+                    "boolean": false
+                  }
                 ]
               }
-            ]
-          }
-        }
-      ]
-    },
-    "clientAnnotations": {
-      "isEditedByUser": true
-    },
-    "isRequired": true
-  },
-  {
-    "instance": {
-      "key": {
-        "publicId": "inject_script",
-        "versionId": "1"
-      },
-      "param": [
-        {
-          "key": "urls",
-          "value": {
-            "type": 2,
-            "listItem": [
-              { "type": 1, "string": "https://api.biscotti-cmp.com/scripts/*" }
             ]
           }
         }
@@ -613,9 +858,18 @@ ___WEB_PERMISSIONS___
           "value": {
             "type": 2,
             "listItem": [
-              { "type": 1, "string": "developer_id.*" },
-              { "type": 1, "string": "ads_data_redaction" },
-              { "type": 1, "string": "url_passthrough" }
+              {
+                "type": 1,
+                "string": "developer_id.*"
+              },
+              {
+                "type": 1,
+                "string": "ads_data_redaction"
+              },
+              {
+                "type": 1,
+                "string": "url_passthrough"
+              }
             ]
           }
         }
@@ -653,396 +907,99 @@ ___WEB_PERMISSIONS___
 ___TESTS___
 
 scenarios:
-- name: setDefaultConsentState is called with all 7 consent types at correct defaults
+- name: global denied fallback is always set before regional defaults
   code: |-
+    var calls = [];
+    mock('setDefaultConsentState', function(value) { calls.push(value); });
+    mock('updateConsentState', function() {});
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('getCookieValues', function() { return []; });
+    mock('localStorage', { getItem: function() { return null; } });
+    mock('copyFromWindow', function() { return null; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
-
-    const mockData = {
+    runCode({
+      defaultSettings: [{ region: 'DE', granted: 'analytics_storage', denied: '' }],
       waitForUpdate: 500,
       enableTcfSupport: false,
       adsDataRedaction: false,
       urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
       gtmOnSuccess: function() {},
       gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertApi('setDefaultConsentState').wasCalledWith({
-      ad_storage: 'denied',
-      ad_user_data: 'denied',
-      ad_personalization: 'denied',
-      analytics_storage: 'denied',
-      functionality_storage: 'denied',
-      personalization_storage: 'denied',
-      security_storage: 'granted',
-      wait_for_update: 500
     });
+    assertThat(calls.length).isEqualTo(2);
+    assertThat(calls[0].analytics_storage).isEqualTo('denied');
+    assertThat(calls[0].region).isEqualTo(undefined);
+    assertThat(calls[1].region[0]).isEqualTo('DE');
+    assertThat(calls[1].analytics_storage).isEqualTo('granted');
 
-- name: updateConsentState is called correctly when valid consent exists in the cookie
+- name: hostile consent type rejects the row and never applies it
   code: |-
-    const storedConsent = '{"categories":{"essential":true,"functional":true,"analytics":true,"marketing":true},"timestamp":"2024-01-01T00:00:00Z","version":"1.0"}';
-
+    var defaults = [];
+    var failed = false;
+    mock('setDefaultConsentState', function(value) { defaults.push(value); });
+    mock('updateConsentState', function() {});
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('getCookieValues', function() { return [storedConsent]; });
+    mock('localStorage', { getItem: function() { return null; } });
+    mock('copyFromWindow', function() { return null; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
-
-    const mockData = {
+    runCode({
+      defaultSettings: [{ region: 'DE', granted: '__proto__', denied: '' }],
       waitForUpdate: 500,
       enableTcfSupport: false,
       adsDataRedaction: false,
       urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
       gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertApi('updateConsentState').wasCalledWith({
-      ad_storage: 'granted',
-      ad_user_data: 'granted',
-      ad_personalization: 'granted',
-      analytics_storage: 'granted',
-      functionality_storage: 'granted',
-      personalization_storage: 'granted',
-      security_storage: 'granted'
+      gtmOnFailure: function() { failed = true; }
     });
+    assertThat(defaults.length).isEqualTo(1);
+    assertThat(failed).isEqualTo(true);
 
-- name: updateConsentState is NOT called when the consent cookie is absent
+- name: stored consent maps all seven signals and current TCF data
   code: |-
+    var updates = [];
+    var events = [];
+    mock('setDefaultConsentState', function() {});
+    mock('updateConsentState', function(value) { updates.push(value); });
     mock('gtagSet', function() {});
-    mock('createQueue', function() { return function() {}; });
-    mock('getCookieValues', function() { return []; });
+    mock('createQueue', function() { return function(value) { events.push(value); }; });
+    mock('localStorage', { getItem: function() { return JSON.stringify({ categories: { functional: true, analytics: true, marketing: false }, tcfString: 'TC', acString: 'AC' }); } });
+    mock('copyFromWindow', function() { return null; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
-
-    const mockData = {
-      waitForUpdate: 500,
-      enableTcfSupport: false,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertApi('updateConsentState').wasNotCalled();
-
-- name: marketing true maps ad_storage ad_user_data and ad_personalization to granted
-  code: |-
-    const storedConsent = '{"categories":{"essential":true,"functional":false,"analytics":false,"marketing":true},"timestamp":"2024-01-01T00:00:00Z","version":"1.0"}';
-
-    mock('gtagSet', function() {});
-    mock('createQueue', function() { return function() {}; });
-    mock('getCookieValues', function() { return [storedConsent]; });
-    mock('callInWindow', function() {});
-    mock('setInWindow', function() {});
-    mock('logToConsole', function() {});
-
-    const mockData = {
-      waitForUpdate: 500,
-      enableTcfSupport: false,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertApi('updateConsentState').wasCalledWith({
-      ad_storage: 'granted',
-      ad_user_data: 'granted',
-      ad_personalization: 'granted',
-      analytics_storage: 'denied',
-      functionality_storage: 'denied',
-      personalization_storage: 'denied',
-      security_storage: 'granted'
+    runCode({
+      defaultSettings: [], waitForUpdate: 500, enableTcfSupport: true,
+      adsDataRedaction: false, urlPassthrough: false,
+      gtmOnSuccess: function() {}, gtmOnFailure: function() {}
     });
+    assertThat(updates[0].ad_storage).isEqualTo('denied');
+    assertThat(updates[0].analytics_storage).isEqualTo('granted');
+    assertThat(updates[0].security_storage).isEqualTo('granted');
+    assertThat(events[0].biscotti_tcf_string).isEqualTo('TC');
+    assertThat(events[0].biscotti_ac_string).isEqualTo('AC');
 
-- name: functional true maps functionality_storage and personalization_storage to granted
+- name: duplicate tag is ignored before defaults and callback registration
   code: |-
-    const storedConsent = '{"categories":{"essential":true,"functional":true,"analytics":false,"marketing":false},"timestamp":"2024-01-01T00:00:00Z","version":"1.0"}';
-
+    var defaults = 0;
+    var success = false;
+    mock('setDefaultConsentState', function() { defaults += 1; });
+    mock('updateConsentState', function() {});
     mock('gtagSet', function() {});
     mock('createQueue', function() { return function() {}; });
-    mock('getCookieValues', function() { return [storedConsent]; });
+    mock('localStorage', { getItem: function() { return null; } });
+    mock('copyFromWindow', function(key) { return key === '__biscottiGtmTemplateVersion' ? '2.0.0' : null; });
     mock('callInWindow', function() {});
     mock('setInWindow', function() {});
     mock('logToConsole', function() {});
-
-    const mockData = {
-      waitForUpdate: 500,
-      enableTcfSupport: false,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertApi('updateConsentState').wasCalledWith({
-      ad_storage: 'denied',
-      ad_user_data: 'denied',
-      ad_personalization: 'denied',
-      analytics_storage: 'denied',
-      functionality_storage: 'granted',
-      personalization_storage: 'granted',
-      security_storage: 'granted'
+    runCode({
+      defaultSettings: [], waitForUpdate: 500, enableTcfSupport: false,
+      adsDataRedaction: false, urlPassthrough: false,
+      gtmOnSuccess: function() { success = true; }, gtmOnFailure: function() {}
     });
-
-- name: gtagSet is called with developer_id
-  code: |-
-    let gtagSetCalls = [];
-    mock('gtagSet', function(key, value) { gtagSetCalls.push({key: key, value: value}); });
-    mock('createQueue', function() { return function() {}; });
-    mock('getCookieValues', function() { return []; });
-    mock('callInWindow', function() {});
-    mock('setInWindow', function() {});
-    mock('logToConsole', function() {});
-
-    const mockData = {
-      waitForUpdate: 500,
-      enableTcfSupport: false,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertApi('gtagSet').wasCalled();
-    assertThat(gtagSetCalls[0].key).contains('developer_id.');
-    assertThat(gtagSetCalls[0].value).isEqualTo(true);
-
-- name: region-specific default consent state when regions are configured
-  code: |-
-    mock('gtagSet', function() {});
-    mock('createQueue', function() { return function() {}; });
-    mock('getCookieValues', function() { return []; });
-    mock('callInWindow', function() {});
-    mock('setInWindow', function() {});
-    mock('logToConsole', function() {});
-
-    const mockData = {
-      defaultSettings: [
-        { region: 'US-CA, US-CO', granted: 'security_storage', denied: 'ad_storage, ad_user_data, ad_personalization, analytics_storage, functionality_storage, personalization_storage' }
-      ],
-      waitForUpdate: 500,
-      enableTcfSupport: false,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertApi('setDefaultConsentState').wasCalledWith({
-      region: ['US-CA', 'US-CO'],
-      security_storage: 'granted',
-      ad_storage: 'denied',
-      ad_user_data: 'denied',
-      ad_personalization: 'denied',
-      analytics_storage: 'denied',
-      functionality_storage: 'denied',
-      personalization_storage: 'denied',
-      wait_for_update: 500
-    });
-
-- name: region row with partial types fills the rest fail-safe to denied
-  code: |-
-    let captured = null;
-    mock('gtagSet', function() {});
-    mock('createQueue', function() { return function() {}; });
-    mock('getCookieValues', function() { return []; });
-    mock('callInWindow', function() {});
-    mock('setInWindow', function() {});
-    mock('logToConsole', function() {});
-    mock('setDefaultConsentState', function(obj) { captured = obj; });
-
-    const mockData = {
-      defaultSettings: [
-        { region: 'DE', granted: 'analytics_storage', denied: '' }
-      ],
-      waitForUpdate: 500,
-      enableTcfSupport: false,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertThat(captured.analytics_storage).isEqualTo('granted');
-    assertThat(captured.ad_storage).isEqualTo('denied');
-    assertThat(captured.ad_user_data).isEqualTo('denied');
-    assertThat(captured.ad_personalization).isEqualTo('denied');
-    assertThat(captured.functionality_storage).isEqualTo('denied');
-    assertThat(captured.personalization_storage).isEqualTo('denied');
-    assertThat(captured.security_storage).isEqualTo('granted');
-
-- name: enableTcfSupport sets the gtag_enable_tcf_support flag
-  code: |-
-    let tcfFlag = null;
-    mock('gtagSet', function() {});
-    mock('createQueue', function() { return function() {}; });
-    mock('getCookieValues', function() { return []; });
-    mock('callInWindow', function() {});
-    mock('setInWindow', function(key, value) { if (key === 'gtag_enable_tcf_support') tcfFlag = value; });
-    mock('logToConsole', function() {});
-
-    const mockData = {
-      waitForUpdate: 500,
-      enableTcfSupport: true,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertThat(tcfFlag).isEqualTo(true);
-
-- name: enableTcfSupport off does NOT set the gtag_enable_tcf_support flag
-  code: |-
-    let tcfFlag = null;
-    mock('gtagSet', function() {});
-    mock('createQueue', function() { return function() {}; });
-    mock('getCookieValues', function() { return []; });
-    mock('callInWindow', function() {});
-    mock('setInWindow', function(key, value) { if (key === 'gtag_enable_tcf_support') tcfFlag = value; });
-    mock('logToConsole', function() {});
-
-    const mockData = {
-      waitForUpdate: 500,
-      enableTcfSupport: false,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertThat(tcfFlag).isEqualTo(null);
-
-- name: wait_for_update value of 0 is preserved not coerced to 500
-  code: |-
-    let captured = null;
-    mock('gtagSet', function() {});
-    mock('createQueue', function() { return function() {}; });
-    mock('getCookieValues', function() { return []; });
-    mock('callInWindow', function() {});
-    mock('setInWindow', function() {});
-    mock('logToConsole', function() {});
-    mock('setDefaultConsentState', function(obj) { captured = obj; });
-
-    const mockData = {
-      waitForUpdate: 0,
-      enableTcfSupport: false,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertThat(captured.wait_for_update).isEqualTo(0);
-
-- name: gtmOnSuccess is called on successful execution
-  code: |-
-    mock('gtagSet', function() {});
-    mock('createQueue', function() { return function() {}; });
-    mock('getCookieValues', function() { return []; });
-    mock('callInWindow', function() {});
-    mock('setInWindow', function() {});
-    mock('logToConsole', function() {});
-
-    const mockData = {
-      waitForUpdate: 500,
-      enableTcfSupport: false,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertApi('gtmOnSuccess').wasCalled();
-    assertApi('gtmOnFailure').wasNotCalled();
-
-- name: dataLayer push with correct event name and payload on consent initialization
-  code: |-
-    const storedConsent = '{"categories":{"essential":true,"functional":false,"analytics":true,"marketing":false},"timestamp":"2024-01-01T00:00:00Z","version":"1.0"}';
-
-    let dataLayerEvents = [];
-    mock('gtagSet', function() {});
-    mock('createQueue', function() { return function(event) { dataLayerEvents.push(event); }; });
-    mock('getCookieValues', function() { return [storedConsent]; });
-    mock('callInWindow', function() {});
-    mock('setInWindow', function() {});
-    mock('logToConsole', function() {});
-
-    const mockData = {
-      waitForUpdate: 500,
-      enableTcfSupport: false,
-      adsDataRedaction: false,
-      urlPassthrough: false,
-      injectBiscottiScript: false,
-      websiteId: '',
-      gtmOnSuccess: function() {},
-      gtmOnFailure: function() {}
-    };
-
-    runCode(mockData);
-
-    assertThat(dataLayerEvents.length).isGreaterThanOrEqualTo(1);
-    assertThat(dataLayerEvents[0].event).isEqualTo('biscotti_consent_initialized');
-    assertThat(dataLayerEvents[0].biscotti_consent.ad_storage).isEqualTo('denied');
-    assertThat(dataLayerEvents[0].biscotti_consent.ad_user_data).isEqualTo('denied');
-    assertThat(dataLayerEvents[0].biscotti_consent.ad_personalization).isEqualTo('denied');
-    assertThat(dataLayerEvents[0].biscotti_consent.analytics_storage).isEqualTo('granted');
-    assertThat(dataLayerEvents[0].biscotti_consent.functionality_storage).isEqualTo('denied');
-    assertThat(dataLayerEvents[0].biscotti_consent.personalization_storage).isEqualTo('denied');
-    assertThat(dataLayerEvents[0].biscotti_consent.security_storage).isEqualTo('granted');
+    assertThat(defaults).isEqualTo(0);
+    assertThat(success).isEqualTo(true);
